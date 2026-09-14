@@ -494,6 +494,68 @@ def test_fractional_seconds_rejected(client):
     assert_422_with_loc(resp, ("body", "pickup_at"))
 
 
+def test_negative_zero_offset_rejected(client):
+    # RFC3339：-00:00 表示“本地偏移未知”，无法确定实际 UTC 时刻，必须拒绝，
+    # 不得当作标准时区 +00:00 参与换算。
+    resp = judge(client, payload(opened_at="2026-09-01T00:00:00-00:00"))
+    assert_422_with_loc(resp, ("body", "opened_at"))
+
+    # +00:00 是确定的 UTC，仍然合法。
+    ok_resp = judge(client, payload(opened_at="2026-09-01T00:00:00+00:00"))
+    assert ok_resp.status_code == 200, ok_resp.text
+
+
+def test_timestamp_crossing_datetime_boundary_rejected_with_field_loc(client):
+    # 字符串格式合法，但换算为 UTC 后越过 datetime 可表示的下边界
+    # （0001-01-01T00:00:00+08:00 = 公元前一年 16:00Z）：必须 422 且 loc 精确到
+    # 时间字段，而不是服务异常。
+    resp = judge(
+        client,
+        payload(
+            opened_at="0001-01-01T00:00:00+08:00",
+            pickup_at="0001-01-01T01:00:00+08:00",
+        ),
+    )
+    assert_422_with_loc(resp, ("body", "opened_at"))
+
+    # 越过上边界（9999-12-31T23:59:59-08:00 换算到次日）同样 422。
+    resp_upper = judge(
+        client,
+        payload(
+            opened_at="9999-12-31T23:59:59-08:00",
+            pickup_at="9999-12-31T23:59:59-01:00",
+        ),
+    )
+    assert_422_with_loc(resp_upper, ("body", "opened_at"))
+
+    # 定位必须能深入到回干区间内的具体时间字段。
+    resp_nested = judge(
+        client,
+        payload(
+            opened_at="0001-01-01T08:00:00Z",
+            pickup_at="0001-01-01T09:00:00Z",
+            dry_intervals=[
+                {
+                    "start": "0001-01-01T00:00:00+08:00",
+                    "end": "0001-01-01T08:30:00Z",
+                }
+            ],
+        ),
+    )
+    assert_422_with_loc(resp_nested, ("body", "dry_intervals", 0, "start"))
+
+
+def test_timestamp_near_boundary_that_stays_in_range_accepted(client):
+    # 对照：换算后仍在可表示范围内的边界时刻必须接受，不能误杀。
+    body = payload(
+        opened_at="0001-01-01T00:00:00-08:00",  # = 0001-01-01T08:00:00Z
+        pickup_at="0001-01-01T09:00:00Z",
+    )
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["total_seconds"] == 3600
+
+
 def test_date_only_rejected(client):
     resp = judge(client, payload(opened_at="2026-09-01"))
     assert_422_with_loc(resp, ("body", "opened_at"))
@@ -642,3 +704,27 @@ def test_interval_with_string_offset_z_and_lowercase(client):
     resp = judge(client, body)
     assert resp.status_code == 200, resp.text
     assert resp.json()["dry_seconds"] == 600
+
+
+def test_leap_second_accepted_and_normalized_to_utc(client):
+    # RFC3339 用 :60 表示闰秒：2016-12-31T23:59:60Z 归一化为 2017-01-01T00:00:00Z。
+    body = payload(
+        opened_at="2016-12-31T23:59:60Z",
+        pickup_at="2017-01-01T00:02:00Z",
+    )
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["opened_at_utc"] == "2017-01-01T00:00:00Z"
+    assert data["pickup_at_utc"] == "2017-01-01T00:02:00Z"
+    assert data["total_seconds"] == 120
+    assert data["verdict"] == "available"
+
+    # 闰秒配非零偏移同样接受：07:59:60+08:00 即 23:59:60Z。
+    body_offset = payload(
+        opened_at="2017-01-01T07:59:60+08:00",
+        pickup_at="2017-01-01T08:02:00+08:00",
+    )
+    resp_offset = judge(client, body_offset)
+    assert resp_offset.status_code == 200, resp_offset.text
+    assert resp_offset.json()["opened_at_utc"] == "2017-01-01T00:00:00Z"
