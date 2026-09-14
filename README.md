@@ -29,6 +29,14 @@
   `pickup_at − 起算时刻`，回干秒数只统计起算时刻之后的区间。
 - 结论唯一：小于限额 `available`，等于限额 `boundary_available`，大于限额 `expired`；
   同时返回非负的 `remaining_minutes`（剩余）或 `exceeded_minutes`（超出）。
+- 可选布尔开关 `include_calculation_trace`（默认 `false`）：为 `true` 时响应
+  额外携带 `calculation_trace`，把 `[实际起算时刻, pickup_at]` 按时间顺序切成
+  `exposed`/`dry` 片段，每段给出 UTC 起止时间与秒数；片段互不重叠、首尾相接，
+  秒数之和等于 `total_seconds`（其中 `dry` 片段合计等于 `dry_seconds`），
+  供质量人员复核回干区间如何影响结论。开关不改变判定结论；省略或为 `false`
+  时响应结构保持原样，非布尔值（如 `"yes"`、`1`、`null`）一律 422 并定位到
+  `include_calculation_trace`。批量接口的每个料盘可各自开启，仅为开启的
+  条目生成片段。
 - 任一等级未知、时间倒置或区间非法：整单返回 **422**，不给出部分判定；
   错误体为 `{"detail": [{"loc": ["body", ...], "msg": ..., "type": ...}]}`，
   `loc` 可定位到具体字段（含数组下标）。
@@ -113,6 +121,25 @@ RFC3339 秒精度时间；提供后暴露从烘烤完成时刻重新累计。
 }
 ```
 
+响应 `200`（上一请求再开启 `include_calculation_trace=true`；附加
+`calculation_trace`，其余字段不变。片段只覆盖起算时刻之后：
+00:30–01:00Z 的回干在烘烤之前，不出现）：
+
+```json
+{
+  "verdict": "available",
+  "...": "...",
+  "total_seconds": 7200,
+  "dry_seconds": 1800,
+  "effective_seconds": 5400,
+  "calculation_trace": [
+    {"kind": "exposed", "start_at_utc": "2026-09-01T02:00:00Z", "end_at_utc": "2026-09-01T02:30:00Z", "seconds": 1800},
+    {"kind": "dry",     "start_at_utc": "2026-09-01T02:30:00Z", "end_at_utc": "2026-09-01T03:00:00Z", "seconds": 1800},
+    {"kind": "exposed", "start_at_utc": "2026-09-01T03:00:00Z", "end_at_utc": "2026-09-01T04:00:00Z", "seconds": 3600}
+  ]
+}
+```
+
 响应 `422`（示例：区间端点相接；烘烤时刻与回干冲突时 `loc` 为
 `["body", "rebake_completed_at"]`，`type` 为
 `value_error.rebake_dry_interval_conflict`）：
@@ -158,7 +185,9 @@ RFC3339 秒精度时间；提供后暴露从烘烤完成时刻重新累计。
 ```
 
 响应 `200`：`items` 为按**输入顺序**排列的完整单盘结果（与逐盘调用
-`POST /judge` 的响应体逐字段一致），`summary` 汇总三种既有结论的数量：
+`POST /judge` 的响应体逐字段一致），`summary` 汇总三种既有结论的数量。
+每个料盘可各自传 `include_calculation_trace=true`，仅为开启的条目附加
+`calculation_trace`，其余条目响应结构不变：
 
 ```json
 {
@@ -228,7 +257,7 @@ app/
   schemas.py   # 请求/响应模型（含批量模型），RFC3339 秒精度时间解析（归一化为 UTC）
   logic.py     # 业务规则校验（422 收集，支持批量 loc 前缀）与暴露时长判定
 tests/
-  test_api.py  # 62 条验收测试：单盘合法/边界/过期/烘烤重置/各类 422 + 批量顺序汇总/嵌套定位/数量边界
+  test_api.py  # 72 条验收测试：单盘合法/边界/过期/烘烤重置/各类 422 + 批量顺序汇总/嵌套定位/数量边界 + 计算片段切分/开关兼容
 Dockerfile
 docker-compose.yml   # api（常驻）+ verify（一次性验收，profile=verify）
 requirements.txt

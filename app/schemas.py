@@ -17,7 +17,14 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_serializer
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_serializer,
+)
 
 # 严格的 RFC3339 秒精度格式（含时区），拒绝小数秒与裸时间。
 # 秒字段额外允许 60：RFC3339 用 :60 表示闰秒，但只有下列 IERS 公告中真实
@@ -171,6 +178,16 @@ class JudgeRequest(BaseModel):
         ),
     )
     dry_intervals: list[DryInterval] = Field(default_factory=list)
+    include_calculation_trace: StrictBool = Field(
+        default=False,
+        description=(
+            "可选：为 true 时响应额外携带 calculation_trace——从实际起算时刻"
+            "（exposure_origin_at_utc）到 pickup_at 的 exposed/dry 计算片段"
+            "（UTC 起止与秒数，按时间顺序、互不重叠、秒数之和等于 "
+            "total_seconds），供复核回干区间如何影响结论；省略或为 false 时"
+            "响应结构与旧版完全一致。必须是布尔值，其他类型一律 422。"
+        ),
+    )
 
 
 class JudgeBatchRequest(BaseModel):
@@ -187,6 +204,24 @@ class JudgeBatchRequest(BaseModel):
             "items 与对应下标。"
         ),
     )
+
+
+class CalculationTraceSegment(BaseModel):
+    """一段计算片段：[start_at_utc, end_at_utc) 内要么计入有效暴露
+    （exposed），要么处于回干柜暂停（dry）。"""
+
+    kind: Literal["exposed", "dry"] = Field(
+        description="exposed=计入有效暴露的时间；dry=回干暂停、不计入的时间。"
+    )
+    start_at_utc: datetime
+    end_at_utc: datetime
+    seconds: int = Field(
+        description="片段时长（秒），等于 end_at_utc − start_at_utc。"
+    )
+
+    @field_serializer("start_at_utc", "end_at_utc")
+    def _serialize_utc(self, value: datetime) -> str:
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class JudgeResponse(BaseModel):
@@ -209,6 +244,15 @@ class JudgeResponse(BaseModel):
     total_seconds: int
     dry_seconds: int
     effective_seconds: int
+    calculation_trace: list[CalculationTraceSegment] | None = Field(
+        default=None,
+        description=(
+            "仅当请求 include_calculation_trace=true 时返回：按时间顺序覆盖 "
+            "[exposure_origin_at_utc, pickup_at_utc] 的计算片段，互不重叠，"
+            "秒数之和等于 total_seconds（其中 dry 片段秒数之和等于 "
+            "dry_seconds）。未请求时响应不携带该字段。"
+        ),
+    )
 
     @field_serializer("opened_at_utc", "pickup_at_utc", "exposure_origin_at_utc")
     def _serialize_utc(self, value: datetime) -> str:

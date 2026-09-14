@@ -1044,3 +1044,255 @@ def test_single_judge_still_available_after_batch_added(client):
     assert_422_with_loc(bad, ("body", "level"))
     # 单盘错误路径保持原样，绝不能被加上 items 前缀。
     assert tuple(bad.json()["detail"][0]["loc"]) == ("body", "level")
+
+
+# ------------------------------------ 计算片段 include_calculation_trace
+
+
+def assert_trace_consistent(data):
+    """片段通用不变量：覆盖 [起算点, 领用点]、首尾相接无重叠、秒数自洽且
+    总和等于 total_seconds，dry 合计等于 dry_seconds。"""
+    trace = data["calculation_trace"]
+    assert [seg["kind"] for seg in trace]  # 非空场景调用
+    assert trace[0]["start_at_utc"] == data["exposure_origin_at_utc"]
+    assert trace[-1]["end_at_utc"] == data["pickup_at_utc"]
+    for prev, curr in zip(trace, trace[1:]):
+        assert prev["end_at_utc"] == curr["start_at_utc"]
+    for seg in trace:
+        start = datetime.strptime(seg["start_at_utc"], "%Y-%m-%dT%H:%M:%SZ")
+        end = datetime.strptime(seg["end_at_utc"], "%Y-%m-%dT%H:%M:%SZ")
+        assert seg["seconds"] == int((end - start).total_seconds()) > 0
+    assert sum(seg["seconds"] for seg in trace) == data["total_seconds"]
+    dry = sum(seg["seconds"] for seg in trace if seg["kind"] == "dry")
+    exposed = sum(seg["seconds"] for seg in trace if seg["kind"] == "exposed")
+    assert dry == data["dry_seconds"]
+    assert exposed == data["effective_seconds"]
+    return trace
+
+
+def test_trace_single_exposed_segment_when_no_dry_intervals(client):
+    # 无回干：从起算点到领用时刻只有一段 exposed。
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=2, minutes=30)),
+        include_calculation_trace=True,
+    )
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total_seconds"] == 9000
+    assert data["calculation_trace"] == [
+        {
+            "kind": "exposed",
+            "start_at_utc": "2026-09-01T00:00:00Z",
+            "end_at_utc": "2026-09-01T02:30:00Z",
+            "seconds": 9000,
+        }
+    ]
+    # 结论与汇总字段不受开关影响。
+    assert data["verdict"] == "available"
+    assert data["effective_exposure_minutes"] == 150
+
+
+def test_trace_splits_multiple_dry_intervals_in_chronological_order(client):
+    # 故意乱序提交两段回干：片段必须按时间顺序完整切分。
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=5)),
+        dry_intervals=[
+            {
+                "start": fmt(OPENED + timedelta(hours=3)),
+                "end": fmt(OPENED + timedelta(hours=3, minutes=30)),
+            },
+            {
+                "start": fmt(OPENED + timedelta(hours=1)),
+                "end": fmt(OPENED + timedelta(hours=2)),
+            },
+        ],
+        include_calculation_trace=True,
+    )
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    trace = assert_trace_consistent(data)
+    assert [seg["kind"] for seg in trace] == [
+        "exposed", "dry", "exposed", "dry", "exposed",
+    ]
+    assert [(seg["start_at_utc"], seg["end_at_utc"]) for seg in trace] == [
+        ("2026-09-01T00:00:00Z", "2026-09-01T01:00:00Z"),
+        ("2026-09-01T01:00:00Z", "2026-09-01T02:00:00Z"),
+        ("2026-09-01T02:00:00Z", "2026-09-01T03:00:00Z"),
+        ("2026-09-01T03:00:00Z", "2026-09-01T03:30:00Z"),
+        ("2026-09-01T03:30:00Z", "2026-09-01T05:00:00Z"),
+    ]
+    assert [seg["seconds"] for seg in trace] == [3600, 3600, 3600, 1800, 5400]
+
+
+def test_trace_interval_touching_origin_starts_with_dry_segment(client):
+    # 回干区间贴着起算点：首段即为 dry，不产出零长 exposed 片段。
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=2)),
+        dry_intervals=[
+            {"start": fmt(OPENED), "end": fmt(OPENED + timedelta(hours=1))}
+        ],
+        include_calculation_trace=True,
+    )
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    trace = assert_trace_consistent(resp.json())
+    assert [seg["kind"] for seg in trace] == ["dry", "exposed"]
+    assert [seg["seconds"] for seg in trace] == [3600, 3600]
+
+
+def test_trace_after_rebake_explains_only_time_after_new_origin(client):
+    # opened 00:00，rebake 02:00，pickup 04:00；00:30–01:00 的回干在起算点
+    # 之前，不得出现在片段里；片段必须从烘烤完成时刻开始。
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=4)),
+        rebake_completed_at=fmt(OPENED + timedelta(hours=2)),
+        dry_intervals=[
+            {
+                "start": fmt(OPENED + timedelta(minutes=30)),
+                "end": fmt(OPENED + timedelta(hours=1)),
+            },
+            {
+                "start": fmt(OPENED + timedelta(hours=2, minutes=30)),
+                "end": fmt(OPENED + timedelta(hours=3)),
+            },
+        ],
+        include_calculation_trace=True,
+    )
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["reset_applied"] is True
+    assert data["calculation_trace"] == [
+        {
+            "kind": "exposed",
+            "start_at_utc": "2026-09-01T02:00:00Z",
+            "end_at_utc": "2026-09-01T02:30:00Z",
+            "seconds": 1800,
+        },
+        {
+            "kind": "dry",
+            "start_at_utc": "2026-09-01T02:30:00Z",
+            "end_at_utc": "2026-09-01T03:00:00Z",
+            "seconds": 1800,
+        },
+        {
+            "kind": "exposed",
+            "start_at_utc": "2026-09-01T03:00:00Z",
+            "end_at_utc": "2026-09-01T04:00:00Z",
+            "seconds": 3600,
+        },
+    ]
+    assert_trace_consistent(data)
+
+
+def test_trace_zero_exposure_returns_empty_segment_list(client):
+    # opened == pickup：没有可解释的时间，片段为空且秒数之和仍为 total_seconds。
+    body = payload(pickup_at=fmt(OPENED), include_calculation_trace=True)
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["total_seconds"] == 0
+    assert data["calculation_trace"] == []
+
+
+def test_trace_omitted_or_false_switch_adds_no_fields(client):
+    # 旧调用（不传开关）与显式 false：单盘与批量响应结构保持原样。
+    for override in ({}, {"include_calculation_trace": False}):
+        body = payload(
+            pickup_at=fmt(OPENED + timedelta(hours=2)),
+            dry_intervals=[
+                {
+                    "start": fmt(OPENED + timedelta(minutes=30)),
+                    "end": fmt(OPENED + timedelta(hours=1)),
+                }
+            ],
+            **override,
+        )
+        resp = judge(client, body)
+        assert resp.status_code == 200, resp.text
+        assert "calculation_trace" not in resp.json()
+
+    resp = judge_batch(client, [available_body(), boundary_body()])
+    assert resp.status_code == 200, resp.text
+    assert all("calculation_trace" not in item for item in resp.json()["items"])
+
+
+def test_trace_non_boolean_switch_rejected_at_field(client):
+    # 开关不是布尔值：422 且精确定位到该字段，不产出判定结果。
+    for bad_value in ("yes", "true", 1, 0, ["true"], None):
+        resp = judge(client, payload(include_calculation_trace=bad_value))
+        assert_422_with_loc(resp, ("body", "include_calculation_trace")), bad_value
+
+
+def test_trace_with_invalid_dry_or_rebake_data_uses_existing_error_chain(client):
+    # 回干数据非法：即使开了开关也走现有错误链路，不返回任何计算结果。
+    body = payload(
+        dry_intervals=[{"start": fmt(OPENED), "end": fmt(OPENED)}],
+        include_calculation_trace=True,
+    )
+    resp = judge(client, body)
+    assert_422_with_loc(resp, ("body", "dry_intervals", 0, "end"))
+    assert "calculation_trace" not in resp.json()
+
+    # 烘烤数据非法：同样整单 422，无计算结果。
+    body_rebake = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=4)),
+        rebake_completed_at=fmt(OPENED + timedelta(minutes=45)),
+        dry_intervals=[
+            {
+                "start": fmt(OPENED + timedelta(minutes=30)),
+                "end": fmt(OPENED + timedelta(hours=1)),
+            }
+        ],
+        include_calculation_trace=True,
+    )
+    resp_rebake = judge(client, body_rebake)
+    assert_422_with_loc(resp_rebake, ("body", "rebake_completed_at"))
+    assert "calculation_trace" not in resp_rebake.json()
+
+
+def test_batch_trace_only_for_items_that_request_it(client):
+    # 批量：仅为主动开启的条目生成片段，顺序、汇总与逐盘一致性保持不变。
+    traced = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=2)),
+        dry_intervals=[
+            {
+                "start": fmt(OPENED + timedelta(minutes=30)),
+                "end": fmt(OPENED + timedelta(hours=1)),
+            }
+        ],
+        include_calculation_trace=True,
+    )
+    resp = judge_batch(client, [available_body(), traced, expired_body()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert [item["verdict"] for item in data["items"]] == [
+        "available", "available", "expired",
+    ]
+    assert "calculation_trace" not in data["items"][0]
+    assert "calculation_trace" not in data["items"][2]
+
+    traced_item = data["items"][1]
+    trace = assert_trace_consistent(traced_item)
+    assert [seg["kind"] for seg in trace] == ["exposed", "dry", "exposed"]
+    # 与单盘调用结果逐字段一致。
+    single = judge(client, traced)
+    assert single.status_code == 200, single.text
+    assert traced_item == single.json()
+
+    assert data["summary"] == {
+        "available": 2,
+        "boundary_available": 0,
+        "expired": 1,
+    }
+
+
+def test_batch_trace_non_boolean_located_with_item_index(client):
+    # 批量中开关类型非法：422 且 loc 带 items 与下标，整批无判定结果。
+    bodies = [available_body(), payload(include_calculation_trace="yes")]
+    resp = judge_batch(client, bodies)
+    assert_422_with_loc(resp, ("body", "items", 1, "include_calculation_trace"))
+    assert "items" not in resp.json()

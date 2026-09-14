@@ -12,6 +12,11 @@
   均以实际起算时刻为基准；
 - 小于限额 → available，等于限额 → boundary_available，大于限额 → expired。
 
+可选的 include_calculation_trace=true 不改变结论，只在响应中附加
+calculation_trace：从实际起算时刻到 pickup_at 按时间顺序排列的
+exposed/dry 计算片段（UTC 起止与秒数），片段互不重叠且秒数之和等于
+total_seconds，供复核回干区间如何影响计算。
+
 任何违规都收集为带字段定位的错误列表，整单以 422 拒绝，不产出部分判定。
 
 批量接口（POST /judge/batch）逐盘复用本模块的同一套校验与判定：校验阶段
@@ -21,12 +26,14 @@
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from datetime import datetime
+from typing import Any, Literal, Sequence
 
 from fastapi.exceptions import RequestValidationError
 
 from .schemas import (
     BatchSummary,
+    CalculationTraceSegment,
     JudgeBatchRequest,
     JudgeBatchResponse,
     JudgeRequest,
@@ -141,6 +148,43 @@ def enforce_business_rules(
         raise RequestValidationError(errors)
 
 
+def _build_calculation_trace(
+    payload: JudgeRequest, origin: datetime
+) -> list[CalculationTraceSegment]:
+    """把 [起算时刻, pickup_at] 按时间顺序切成 exposed/dry 片段。
+
+    区间过滤与 dry_seconds 完全一致（只算起算时刻之后的回干区间），因此
+    全部 dry 片段秒数之和等于 dry_seconds，所有片段秒数之和等于
+    total_seconds；校验已保证区间互不重叠且不端点相接，故片段首尾相接、
+    两两不重叠。零暴露（opened_at == pickup_at 且无相关区间）时为空列表。
+    """
+    segments: list[CalculationTraceSegment] = []
+
+    def segment(
+        kind: Literal["exposed", "dry"], start: datetime, end: datetime
+    ) -> CalculationTraceSegment:
+        return CalculationTraceSegment(
+            kind=kind,
+            start_at_utc=start,
+            end_at_utc=end,
+            seconds=int((end - start).total_seconds()),
+        )
+
+    cursor = origin
+    relevant = sorted(
+        (i for i in payload.dry_intervals if i.start >= origin),
+        key=lambda i: (i.start, i.end),
+    )
+    for interval in relevant:
+        if interval.start > cursor:
+            segments.append(segment("exposed", cursor, interval.start))
+        segments.append(segment("dry", interval.start, interval.end))
+        cursor = interval.end
+    if cursor < payload.pickup_at:
+        segments.append(segment("exposed", cursor, payload.pickup_at))
+    return segments
+
+
 def compute_judgement(payload: JudgeRequest) -> JudgeResponse:
     """在已通过全部校验的请求上计算唯一上线结论与可复核分钟数。"""
     reset_applied = payload.rebake_completed_at is not None
@@ -183,6 +227,11 @@ def compute_judgement(payload: JudgeRequest) -> JudgeResponse:
         total_seconds=total_seconds,
         dry_seconds=dry_seconds,
         effective_seconds=effective_seconds,
+        calculation_trace=(
+            _build_calculation_trace(payload, origin)
+            if payload.include_calculation_trace
+            else None
+        ),
     )
 
 
