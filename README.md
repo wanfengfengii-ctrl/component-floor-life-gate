@@ -32,6 +32,11 @@
 - 任一等级未知、时间倒置或区间非法：整单返回 **422**，不给出部分判定；
   错误体为 `{"detail": [{"loc": ["body", ...], "msg": ..., "type": ...}]}`，
   `loc` 可定位到具体字段（含数组下标）。
+- 批量接口 `POST /judge/batch` 接收 **1–100 个按顺序排列**的单盘请求，
+  完全复用上述时间解析、烘烤重置、回干校验与暴露计算；任一料盘非法则
+  整批 422 且不产出任何判定，错误 `loc` 在原字段路径前插入 `items` 与
+  对应下标（如 `["body", "items", 3, "dry_intervals", 0, "end"]`）；
+  `items` 缺失、为空或超过 100 项同样 422，定位 `["body", "items"]`。
 
 ## API
 
@@ -124,6 +129,63 @@ RFC3339 秒精度时间；提供后暴露从烘烤完成时刻重新累计。
 }
 ```
 
+### `POST /judge/batch`
+
+供生产排程员一次评估同批料盘，减少逐盘往返。请求体为
+`{"items": [ ... ]}`，`items` 为 **1–100 个按顺序排列**的 `POST /judge`
+同构请求（字段、时间格式、默认值规则完全一致）：
+
+```json
+{
+  "items": [
+    {
+      "level": "MSL3",
+      "opened_at": "2026-09-01T00:00:00Z",
+      "pickup_at": "2026-09-01T01:00:00Z"
+    },
+    {
+      "level": "MSL3",
+      "opened_at": "2026-09-01T00:00:00Z",
+      "pickup_at": "2026-09-01T02:48:00Z"
+    },
+    {
+      "level": "MSL4",
+      "opened_at": "2026-09-01T00:00:00Z",
+      "pickup_at": "2026-09-01T02:00:00Z"
+    }
+  ]
+}
+```
+
+响应 `200`：`items` 为按**输入顺序**排列的完整单盘结果（与逐盘调用
+`POST /judge` 的响应体逐字段一致），`summary` 汇总三种既有结论的数量：
+
+```json
+{
+  "items": [
+    {"verdict": "available", "...": "..."},
+    {"verdict": "boundary_available", "...": "..."},
+    {"verdict": "expired", "...": "..."}
+  ],
+  "summary": {
+    "available": 1,
+    "boundary_available": 1,
+    "expired": 1
+  }
+}
+```
+
+非法请求整批返回 **422**，不产出任何判定结果（响应无 `items`）：
+
+- 任一料盘不合法（模型错误或业务规则错误）：错误 `loc` 在单盘字段路径前
+  插入 `items` 与下标，例如时间倒置为
+  `["body", "items", 1, "pickup_at"]`，下标 2 的第 1 个回干区间零长为
+  `["body", "items", 2, "dry_intervals", 0, "end"]`；同一批多个料盘违规时
+  错误一次性全部返回；
+- `items` 缺失、不是数组、为空（`too_short`）或超过 100 项
+  （`too_long`）：`loc` 为 `["body", "items"]`；
+- 顶层多余字段同样 422（如 `["body", "note"]`）。
+
 ### `GET /healthz`
 
 健康检查，返回 `{"status": "ok"}`。
@@ -162,11 +224,11 @@ VERIFY_BASE_URL=http://127.0.0.1:8000 pytest   # 对运行中的服务做黑盒�
 
 ```
 app/
-  main.py      # FastAPI 入口：/judge、/healthz
-  schemas.py   # 请求/响应模型，RFC3339 秒精度时间解析（归一化为 UTC）
-  logic.py     # 业务规则校验（422 收集）与暴露时长判定
+  main.py      # FastAPI 入口：/judge、/judge/batch、/healthz
+  schemas.py   # 请求/响应模型（含批量模型），RFC3339 秒精度时间解析（归一化为 UTC）
+  logic.py     # 业务规则校验（422 收集，支持批量 loc 前缀）与暴露时长判定
 tests/
-  test_api.py  # 45 条验收测试：合法/边界/过期/烘烤重置/各类 422
+  test_api.py  # 62 条验收测试：单盘合法/边界/过期/烘烤重置/各类 422 + 批量顺序汇总/嵌套定位/数量边界
 Dockerfile
 docker-compose.yml   # api（常驻）+ verify（一次性验收，profile=verify）
 requirements.txt

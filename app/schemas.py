@@ -173,6 +173,22 @@ class JudgeRequest(BaseModel):
     dry_intervals: list[DryInterval] = Field(default_factory=list)
 
 
+class JudgeBatchRequest(BaseModel):
+    """批量判定请求：1–100 个按顺序排列的现有单盘判定请求。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[JudgeRequest] = Field(
+        min_length=1,
+        max_length=100,
+        description=(
+            "按顺序排列的单盘判定请求（与 POST /judge 请求体同构），数量必须在 "
+            "[1, 100]；任一料盘不合法则整批 422，错误 loc 在原字段路径前插入 "
+            "items 与对应下标。"
+        ),
+    )
+
+
 class JudgeResponse(BaseModel):
     verdict: Verdict
     limit_minutes: int
@@ -197,3 +213,22 @@ class JudgeResponse(BaseModel):
     @field_serializer("opened_at_utc", "pickup_at_utc", "exposure_origin_at_utc")
     def _serialize_utc(self, value: datetime) -> str:
         return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class BatchSummary(BaseModel):
+    """整批三种既有结论的数量汇总。"""
+
+    available: int = Field(description="结论为 available 的料盘数量。")
+    boundary_available: int = Field(
+        description="结论为 boundary_available 的料盘数量。"
+    )
+    expired: int = Field(description="结论为 expired 的料盘数量。")
+
+
+class JudgeBatchResponse(BaseModel):
+    """批量判定响应：结果按输入顺序完整返回，并汇总三种结论的数量。"""
+
+    items: list[JudgeResponse] = Field(
+        description="按输入顺序排列的完整单盘判定结果。"
+    )
+    summary: BatchSummary

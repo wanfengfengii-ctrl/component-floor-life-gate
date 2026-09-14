@@ -4,15 +4,23 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from .logic import compute_judgement, enforce_business_rules
-from .schemas import JudgeRequest, JudgeResponse
+from .logic import (
+    compute_batch_judgement,
+    compute_judgement,
+    enforce_business_rules,
+)
+from .schemas import JudgeBatchRequest, JudgeBatchResponse, JudgeRequest, JudgeResponse
 
 app = FastAPI(
     title="MSL Floor-Life Judge",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "判定已开封湿敏元件在扣除回干柜暂停时段后是否仍可上线。"
         "所有时间按 UTC 比较；非法请求整单返回 422。\n\n"
+        "- `POST /judge`：单盘判定。\n"
+        "- `POST /judge/batch`：一次提交 1–100 个按顺序排列的单盘请求，"
+        "复用同一套时间解析与判定规则，按输入顺序返回完整结果并汇总三种"
+        "结论数量；任一料盘非法则整批 422，错误 loc 前缀为 items 与下标。\n\n"
         "可选字段 `rebake_completed_at` 表示该已开封料盘一次合格烘烤的完成时刻；"
         "提供后有效暴露从该时刻重新累计，并继续扣除该时刻之后的回干区间，"
         "响应通过 `reset_applied=true` 与 `exposure_origin_at_utc` 供调用方复核。"
@@ -39,3 +47,18 @@ def judge(payload: JudgeRequest) -> JudgeResponse:
     """
     enforce_business_rules(payload)
     return compute_judgement(payload)
+
+
+@app.post("/judge/batch", response_model=JudgeBatchResponse)
+def judge_batch(payload: JudgeBatchRequest) -> JudgeBatchResponse:
+    """批量判定 1–100 个料盘。
+
+    - 时间解析、烘烤重置、回干校验与暴露计算完全复用单盘链路；
+    - 任一料盘不合法则整批 422 且不产出任何判定结果，错误 ``loc`` 在原字段
+      路径前插入 ``items`` 与下标（如
+      ``("body", "items", 3, "dry_intervals", 0, "end")``）；
+    - ``items`` 为空或超过 100 项同样 422，定位到 ``items``；
+    - 全部合法时结果按输入顺序完整返回，并在 ``summary`` 中汇总
+      ``available`` / ``boundary_available`` / ``expired`` 三种结论的数量。
+    """
+    return compute_batch_judgement(payload)

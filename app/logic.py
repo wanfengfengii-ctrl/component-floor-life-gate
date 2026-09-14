@@ -13,15 +13,25 @@
 - 小于限额 → available，等于限额 → boundary_available，大于限额 → expired。
 
 任何违规都收集为带字段定位的错误列表，整单以 422 拒绝，不产出部分判定。
+
+批量接口（POST /judge/batch）逐盘复用本模块的同一套校验与判定：校验阶段
+给每个料盘的错误 loc 前缀 ``("items", 下标)`` 后统一收集，任一料盘违规即
+整批 422；全部合法时按输入顺序计算，并汇总三种结论的数量。
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 from fastapi.exceptions import RequestValidationError
 
-from .schemas import JudgeRequest, JudgeResponse
+from .schemas import (
+    BatchSummary,
+    JudgeBatchRequest,
+    JudgeBatchResponse,
+    JudgeRequest,
+    JudgeResponse,
+)
 
 # 各湿敏等级允许的有效暴露分钟数（固定值）。
 MSL_LIMIT_MINUTES: dict[str, int] = {
@@ -35,16 +45,27 @@ def _error(loc: tuple[Any, ...], msg: str, type_: str) -> dict[str, Any]:
     return {"loc": ("body",) + loc, "msg": msg, "type": type_}
 
 
-def enforce_business_rules(payload: JudgeRequest) -> None:
-    """校验跨字段业务规则；有任何违规则抛出 RequestValidationError（→ 422）。"""
+def enforce_business_rules(
+    payload: JudgeRequest, loc_prefix: Sequence[Any] = ()
+) -> None:
+    """校验跨字段业务规则；有任何违规则抛出 RequestValidationError（→ 422）。
+
+    ``loc_prefix`` 拼在所有错误字段路径的 ``body`` 之后、字段名之前：
+    单盘接口为空（保持 ``("body", "pickup_at")`` 等旧定位不变），批量接口
+    传入 ``("items", index)``，使错误精确定位到具体料盘。
+    """
     errors: list[dict[str, Any]] = []
+
+    def err(field_loc: tuple[Any, ...], msg: str, type_: str) -> dict[str, Any]:
+        return _error(tuple(loc_prefix) + field_loc, msg, type_)
+
     opened = payload.opened_at
     pickup = payload.pickup_at
     intervals = payload.dry_intervals
 
     if opened > pickup:
         errors.append(
-            _error(
+            err(
                 ("pickup_at",),
                 "opened_at must not be later than pickup_at",
                 "value_error.time_inverted",
@@ -55,7 +76,7 @@ def enforce_business_rules(payload: JudgeRequest) -> None:
     if rebake is not None:
         if not (opened < rebake < pickup):
             errors.append(
-                _error(
+                err(
                     ("rebake_completed_at",),
                     "rebake_completed_at must be strictly between opened_at and "
                     "pickup_at",
@@ -66,7 +87,7 @@ def enforce_business_rules(payload: JudgeRequest) -> None:
         for index, interval in enumerate(intervals):
             if interval.start <= rebake <= interval.end:
                 errors.append(
-                    _error(
+                    err(
                         ("rebake_completed_at",),
                         f"rebake_completed_at must not fall inside dry interval "
                         f"#{index} or coincide with either of its endpoints",
@@ -77,7 +98,7 @@ def enforce_business_rules(payload: JudgeRequest) -> None:
     for index, interval in enumerate(intervals):
         if interval.start >= interval.end:
             errors.append(
-                _error(
+                err(
                     ("dry_intervals", index, "end"),
                     "dry interval end must be strictly after its start",
                     "value_error.dry_interval_not_positive",
@@ -85,7 +106,7 @@ def enforce_business_rules(payload: JudgeRequest) -> None:
             )
         if interval.start < opened:
             errors.append(
-                _error(
+                err(
                     ("dry_intervals", index, "start"),
                     "dry interval starts before opened_at; intervals must lie "
                     "within [opened_at, pickup_at]",
@@ -94,7 +115,7 @@ def enforce_business_rules(payload: JudgeRequest) -> None:
             )
         if interval.end > pickup:
             errors.append(
-                _error(
+                err(
                     ("dry_intervals", index, "end"),
                     "dry interval ends after pickup_at; intervals must lie "
                     "within [opened_at, pickup_at]",
@@ -107,7 +128,7 @@ def enforce_business_rules(payload: JudgeRequest) -> None:
     for (prev_index, prev), (curr_index, curr) in zip(ordered, ordered[1:]):
         if curr.start <= prev.end:
             errors.append(
-                _error(
+                err(
                     ("dry_intervals", curr_index, "start"),
                     f"dry interval #{curr_index} overlaps or touches dry interval "
                     f"#{prev_index}; intervals must be disjoint and may not share "
@@ -163,3 +184,24 @@ def compute_judgement(payload: JudgeRequest) -> JudgeResponse:
         dry_seconds=dry_seconds,
         effective_seconds=effective_seconds,
     )
+
+
+def compute_batch_judgement(payload: JudgeBatchRequest) -> JudgeBatchResponse:
+    """先整批校验（任一料盘非法即整批 422，不产出任何判定），再按输入顺序
+    复用单盘计算并汇总三种结论的数量。"""
+    errors: list[dict[str, Any]] = []
+    for index, item in enumerate(payload.items):
+        try:
+            enforce_business_rules(item, loc_prefix=("items", index))
+        except RequestValidationError as exc:
+            errors.extend(exc.errors())
+    if errors:
+        raise RequestValidationError(errors)
+
+    results = [compute_judgement(item) for item in payload.items]
+    summary = BatchSummary(
+        available=sum(r.verdict == "available" for r in results),
+        boundary_available=sum(r.verdict == "boundary_available" for r in results),
+        expired=sum(r.verdict == "expired" for r in results),
+    )
+    return JudgeBatchResponse(items=results, summary=summary)

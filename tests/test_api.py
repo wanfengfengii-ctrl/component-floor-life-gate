@@ -768,3 +768,279 @@ def test_non_leap_second_60_rejected(client):
         ),
     )
     assert_422_with_loc(bad_resp, ("body", "opened_at"))
+
+
+# ---------------------------------------------------- 批量判定 POST /judge/batch
+
+
+def judge_batch(client, bodies):
+    return client.post("/judge/batch", json={"items": bodies})
+
+
+def available_body():
+    # MSL3、有效暴露 60 分钟 → available。
+    return payload(pickup_at=fmt(OPENED + timedelta(hours=1)))
+
+
+def boundary_body():
+    # MSL3、有效暴露恰好 168 分钟 → boundary_available。
+    return payload(pickup_at=fmt(OPENED + timedelta(minutes=168)))
+
+
+def expired_body():
+    # MSL4、有效暴露 120 分钟 > 72 → expired。
+    return payload(
+        level="MSL4",
+        pickup_at=fmt(OPENED + timedelta(hours=2)),
+    )
+
+
+VERDICT_BODIES = {
+    "available": available_body,
+    "boundary_available": boundary_body,
+    "expired": expired_body,
+}
+
+
+def test_batch_mixed_verdicts_preserve_order_and_summary(client):
+    order = ["expired", "boundary_available", "available",
+             "boundary_available", "available"]
+    bodies = [VERDICT_BODIES[name]() for name in order]
+    resp = judge_batch(client, bodies)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    # 结果按输入顺序完整返回，字段与单盘响应一致。
+    assert len(data["items"]) == 5
+    assert [item["verdict"] for item in data["items"]] == order
+    for item, body, name in zip(data["items"], bodies, order):
+        single = judge(client, body)
+        assert single.status_code == 200, single.text
+        assert item == single.json()  # 批量结果必须与逐盘调用完全一致
+        assert item["verdict"] == name
+
+    # 三种既有结论数量汇总，便于排程员直接确认整批分布。
+    assert data["summary"] == {
+        "available": 2,
+        "boundary_available": 2,
+        "expired": 1,
+    }
+
+
+def test_batch_single_item_lower_bound(client):
+    # 合法下限：恰好 1 项必须得到确定响应。
+    resp = judge_batch(client, [available_body()])
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert len(data["items"]) == 1
+    assert data["items"][0]["verdict"] == "available"
+    assert data["summary"] == {
+        "available": 1,
+        "boundary_available": 0,
+        "expired": 0,
+    }
+
+
+def test_batch_one_hundred_items_upper_bound(client):
+    # 合法上限：恰好 100 项必须全部完成判定，顺序不重排。
+    bodies = [expired_body()] + [available_body()] * 99
+    resp = judge_batch(client, bodies)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert len(data["items"]) == 100
+    assert data["items"][0]["verdict"] == "expired"
+    assert all(item["verdict"] == "available" for item in data["items"][1:])
+    assert data["summary"] == {
+        "available": 99,
+        "boundary_available": 0,
+        "expired": 1,
+    }
+    # 每项的 opened/pickup 与输入下标对应，证明没有串行错位。
+    assert data["items"][0]["limit_minutes"] == 72
+    assert data["items"][1]["limit_minutes"] == 168
+
+
+def test_batch_reuses_single_rebake_and_dry_interval_rules(client):
+    # 烘烤重置与烘烤后回干扣除在批量链路中与单盘完全一致。
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=4)),
+        rebake_completed_at=fmt(OPENED + timedelta(hours=2)),
+        dry_intervals=[
+            {
+                "start": fmt(OPENED + timedelta(minutes=30)),
+                "end": fmt(OPENED + timedelta(hours=1)),
+            },
+            {
+                "start": fmt(OPENED + timedelta(hours=2, minutes=30)),
+                "end": fmt(OPENED + timedelta(hours=3)),
+            },
+        ],
+    )
+    single = judge(client, body)
+    assert single.status_code == 200, single.text
+
+    resp = judge_batch(client, [available_body(), body, expired_body()])
+    assert resp.status_code == 200, resp.text
+    middle = resp.json()["items"][1]
+    assert middle == single.json()
+    assert middle["reset_applied"] is True
+    assert middle["effective_exposure_minutes"] == 90
+    assert middle["verdict"] == "available"
+
+
+def test_batch_empty_items_rejected_at_items(client):
+    # 空批次无意义：422 且 loc 直接定位 items。
+    resp = judge_batch(client, [])
+    assert_422_with_loc(resp, ("body", "items"))
+    assert resp.json()["detail"][0]["type"] == "too_short"
+    assert "items" not in resp.json()  # 不产生判定结果
+
+
+def test_batch_missing_items_rejected_at_items(client):
+    resp = client.post("/judge/batch", json={})
+    assert_422_with_loc(resp, ("body", "items"))
+    assert resp.json()["detail"][0]["type"] == "missing"
+
+
+def test_batch_items_must_be_list(client):
+    resp = client.post("/judge/batch", json={"items": "nope"})
+    assert_422_with_loc(resp, ("body", "items"))
+    assert resp.json()["detail"][0]["type"] == "list_type"
+
+
+def test_batch_101_items_rejected_at_items(client):
+    # 超过一百项：422 且 loc 定位 items，防止单次计算量失控。
+    resp = judge_batch(client, [available_body()] * 101)
+    assert_422_with_loc(resp, ("body", "items"))
+    detail = resp.json()["detail"][0]
+    assert detail["type"] == "too_long"
+    assert detail["ctx"]["max_length"] == 100
+    assert detail["ctx"]["actual_length"] == 101
+    assert "items" not in resp.json()  # 不产生部分判定
+
+
+def test_batch_business_error_nested_with_items_and_index(client):
+    # 下标 1 的料盘 pickup 早于 opened：loc 在原字段路径前加 items 与下标。
+    bodies = [
+        available_body(),
+        payload(pickup_at=fmt(OPENED - timedelta(seconds=1))),
+        expired_body(),
+    ]
+    resp = judge_batch(client, bodies)
+    assert_422_with_loc(resp, ("body", "items", 1, "pickup_at"))
+    assert resp.json()["detail"][0]["type"] == "value_error.time_inverted"
+    assert "items" not in resp.json()  # 任一料盘非法 → 整批无判定结果
+
+
+def test_batch_nested_dry_interval_error_includes_index(client):
+    # 错误定位深入到具体料盘的具体回干区间字段。
+    bodies = [
+        available_body(),
+        available_body(),
+        payload(
+            dry_intervals=[
+                {
+                    "start": fmt(OPENED + timedelta(minutes=30)),
+                    "end": fmt(OPENED + timedelta(minutes=10)),
+                }
+            ]
+        ),
+    ]
+    resp = judge_batch(client, bodies)
+    assert_422_with_loc(
+        resp, ("body", "items", 2, "dry_intervals", 0, "end")
+    )
+
+
+def test_batch_rebake_conflict_nested_with_index(client):
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=4)),
+        rebake_completed_at=fmt(OPENED + timedelta(minutes=45)),
+        dry_intervals=[
+            {
+                "start": fmt(OPENED + timedelta(minutes=30)),
+                "end": fmt(OPENED + timedelta(hours=1)),
+            }
+        ],
+    )
+    resp = judge_batch(client, [available_body(), body])
+    assert_422_with_loc(resp, ("body", "items", 1, "rebake_completed_at"))
+    assert (
+        resp.json()["detail"][0]["type"]
+        == "value_error.rebake_dry_interval_conflict"
+    )
+
+
+def test_batch_collects_errors_from_multiple_invalid_items(client):
+    # 多个料盘各自违规时错误一次性全部返回，下标互不混淆。
+    bodies = [
+        payload(pickup_at=fmt(OPENED - timedelta(seconds=1))),  # 0: 时间倒置
+        available_body(),                                       # 1: 合法
+        payload(
+            dry_intervals=[
+                {"start": fmt(OPENED), "end": fmt(OPENED)}      # 2: 零长区间
+            ]
+        ),
+    ]
+    resp = judge_batch(client, bodies)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    locs = [tuple(item["loc"]) for item in detail]
+    assert ("body", "items", 0, "pickup_at") in locs
+    assert ("body", "items", 2, "dry_intervals", 0, "end") in locs
+    assert all(loc[:3] != ("body", "items", 1) for loc in locs)
+    assert "items" not in resp.json()
+
+
+def test_batch_schema_error_nested_with_index(client):
+    # 模型层错误（未知等级 / 裸时间 / 小数秒）同样加 items 与下标前缀。
+    bodies = [
+        available_body(),
+        payload(
+            level="MSL1",
+            opened_at="2026-09-01T00:00:00",  # 裸时间
+        ),
+        payload(pickup_at="2026-09-01T01:00:00.500Z"),  # 小数秒
+    ]
+    resp = judge_batch(client, bodies)
+    assert resp.status_code == 422
+    locs = [tuple(item["loc"]) for item in resp.json()["detail"]]
+    assert ("body", "items", 1, "level") in locs
+    assert ("body", "items", 1, "opened_at") in locs
+    assert ("body", "items", 2, "pickup_at") in locs
+
+
+def test_batch_extra_field_inside_item_nested(client):
+    body = payload(comment="extra")
+    resp = judge_batch(client, [available_body(), body])
+    assert_422_with_loc(resp, ("body", "items", 1, "comment"))
+
+
+def test_batch_extra_top_level_field_rejected(client):
+    resp = client.post(
+        "/judge/batch", json={"items": [available_body()], "note": 1}
+    )
+    assert_422_with_loc(resp, ("body", "note"))
+
+
+def test_batch_zero_exposure_item_matches_single(client):
+    # opened == pickup 的零暴露边界在批量中同样可用且结果与单盘一致。
+    body = payload(pickup_at=fmt(OPENED))
+    resp = judge_batch(client, [body])
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["items"][0]
+    assert item == judge(client, body).json()
+    assert item["verdict"] == "available"
+    assert item["total_seconds"] == 0
+
+
+def test_single_judge_still_available_after_batch_added(client):
+    # 回归确认：新增批量接口后，单盘接口的请求、响应与错误格式保持不变。
+    ok = judge(client, available_body())
+    assert ok.status_code == 200
+    assert ok.json()["verdict"] == "available"
+
+    bad = judge(client, payload(level="MSL1"))
+    assert_422_with_loc(bad, ("body", "level"))
+    # 单盘错误路径保持原样，绝不能被加上 items 前缀。
+    assert tuple(bad.json()["detail"][0]["loc"]) == ("body", "level")
