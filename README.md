@@ -13,7 +13,15 @@
 - 每个回干区间须 `start < end`，且完整落在 `[opened_at, pickup_at]` 内
   （允许贴着两端边界）。
 - 回干区间两两不得相交，也不得端点相接（前一段 `end` 必须严格小于后一段 `start`）。
-- `有效暴露分钟 = floor((总秒数 − 回干秒数合计) / 60)`。
+- 可选的 `rebake_completed_at` 表示该已开封料盘**一次合格烘烤的完成时刻**，
+  适用于领取曾完成合格烘烤的料盘：
+  - 必须严格位于 `(opened_at, pickup_at)` 内，且不能落在任何回干区间内或与其
+    端点重合，否则整单 422，`loc` 精确定位到 `rebake_completed_at`；
+  - 提供后有效暴露从该时刻**重新累计**，并继续扣除该时刻**之后**的回干区间
+    （该时刻之前的区间不再影响结论）；
+  - 省略（或为 `null`）时从 `opened_at` 起算，计算与旧版完全一致。
+- `有效暴露分钟 = floor((总秒数 − 回干秒数合计) / 60)`；重新累计时总秒数为
+  `pickup_at − 起算时刻`，回干秒数只统计起算时刻之后的区间。
 - 结论唯一：小于限额 `available`，等于限额 `boundary_available`，大于限额 `expired`；
   同时返回非负的 `remaining_minutes`（剩余）或 `exceeded_minutes`（超出）。
 - 任一等级未知、时间倒置或区间非法：整单返回 **422**，不给出部分判定；
@@ -37,9 +45,26 @@
 }
 ```
 
-`dry_intervals` 可省略或为空数组。
+`dry_intervals` 可省略或为空数组。可选字段 `rebake_completed_at` 为带时区
+RFC3339 秒精度时间；提供后暴露从烘烤完成时刻重新累计。
 
-响应 `200`：
+```json
+{
+  "level": "MSL3",
+  "opened_at": "2026-09-01T08:00:00+08:00",
+  "pickup_at": "2026-09-01T12:00:00+08:00",
+  "rebake_completed_at": "2026-09-01T10:00:00+08:00",
+  "dry_intervals": [
+    {"start": "2026-09-01T00:30:00Z", "end": "2026-09-01T01:00:00Z"},
+    {"start": "2026-09-01T02:30:00Z", "end": "2026-09-01T03:00:00Z"}
+  ]
+}
+```
+
+上例：起算（烘烤完成）02:00Z → pickup 04:00Z，总 7200 秒；02:30–03:00Z
+的回干在烘烤之后，继续扣除 1800 秒；00:30–01:00Z 的区间在烘烤之前，不影响结论。
+
+响应 `200`（不传 `rebake_completed_at`，兼容旧客户端；新增字段为默认值）：
 
 ```json
 {
@@ -50,13 +75,37 @@
   "exceeded_minutes": 0,
   "opened_at_utc": "2026-09-01T00:00:00Z",
   "pickup_at_utc": "2026-09-01T02:30:00Z",
+  "exposure_origin_at_utc": "2026-09-01T00:00:00Z",
+  "reset_applied": false,
   "total_seconds": 9000,
   "dry_seconds": 1800,
   "effective_seconds": 7200
 }
 ```
 
-响应 `422`（示例：区间端点相接）：
+响应 `200`（传入 `rebake_completed_at`；`exposure_origin_at_utc` 即烘烤完成
+时刻 UTC，`reset_applied=true`）：
+
+```json
+{
+  "verdict": "available",
+  "limit_minutes": 168,
+  "effective_exposure_minutes": 90,
+  "remaining_minutes": 78,
+  "exceeded_minutes": 0,
+  "opened_at_utc": "2026-09-01T00:00:00Z",
+  "pickup_at_utc": "2026-09-01T04:00:00Z",
+  "exposure_origin_at_utc": "2026-09-01T02:00:00Z",
+  "reset_applied": true,
+  "total_seconds": 7200,
+  "dry_seconds": 1800,
+  "effective_seconds": 5400
+}
+```
+
+响应 `422`（示例：区间端点相接；烘烤时刻与回干冲突时 `loc` 为
+`["body", "rebake_completed_at"]`，`type` 为
+`value_error.rebake_dry_interval_conflict`）：
 
 ```json
 {
@@ -112,7 +161,7 @@ app/
   schemas.py   # 请求/响应模型，RFC3339 秒精度时间解析（归一化为 UTC）
   logic.py     # 业务规则校验（422 收集）与暴露时长判定
 tests/
-  test_api.py  # 28 条验收测试：合法/边界/过期/各类 422
+  test_api.py  # 40 条验收测试：合法/边界/过期/烘烤重置/各类 422
 Dockerfile
 docker-compose.yml   # api（常驻）+ verify（一次性验收，profile=verify）
 requirements.txt

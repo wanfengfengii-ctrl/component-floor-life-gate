@@ -216,6 +216,240 @@ def test_dry_intervals_default_to_empty(client):
     assert resp.json()["dry_seconds"] == 0
 
 
+# ------------------------------------------------ 合格烘烤后重新累计（rebake）
+
+
+def test_rebake_resets_exposure_and_makes_reel_available(client):
+    # 不烘烤：opened → pickup 共 200 分钟 > 168，必然 expired。
+    expired_body = payload(pickup_at=fmt(OPENED + timedelta(minutes=200)))
+    expired_resp = judge(client, expired_body)
+    assert expired_resp.status_code == 200, expired_resp.text
+    assert expired_resp.json()["verdict"] == "expired"
+
+    # 在 190 分钟处完成合格烘烤，重新累计 10 分钟 → available。
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(minutes=200)),
+        rebake_completed_at=fmt(OPENED + timedelta(minutes=190)),
+    )
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["reset_applied"] is True
+    assert data["exposure_origin_at_utc"] == fmt(OPENED + timedelta(minutes=190))
+    assert data["opened_at_utc"] == "2026-09-01T00:00:00Z"
+    assert data["pickup_at_utc"] == fmt(OPENED + timedelta(minutes=200))
+    assert data["total_seconds"] == 600
+    assert data["dry_seconds"] == 0
+    assert data["effective_seconds"] == 600
+    assert data["effective_exposure_minutes"] == 10
+    assert data["verdict"] == "available"
+    assert data["remaining_minutes"] == 158
+    assert data["exceeded_minutes"] == 0
+
+
+def test_rebake_boundary_available_after_reset(client):
+    # 重新累计恰好 168 分钟 → boundary_available。
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=10)),
+        rebake_completed_at=fmt(OPENED + timedelta(hours=10) - timedelta(minutes=168)),
+    )
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["reset_applied"] is True
+    assert data["effective_exposure_minutes"] == 168
+    assert data["verdict"] == "boundary_available"
+    assert data["remaining_minutes"] == 0
+    assert data["exceeded_minutes"] == 0
+
+
+def test_dry_interval_after_rebake_still_deducted(client):
+    # opened 00:00，rebake 02:00，pickup 04:00 → 重累计 120 分钟；
+    # 02:30-03:00（烘烤后）30 分钟回干必须扣除；00:30-01:00（烘烤前）忽略。
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=4)),
+        rebake_completed_at=fmt(OPENED + timedelta(hours=2)),
+        dry_intervals=[
+            {
+                "start": fmt(OPENED + timedelta(minutes=30)),
+                "end": fmt(OPENED + timedelta(hours=1)),
+            },
+            {
+                "start": fmt(OPENED + timedelta(hours=2, minutes=30)),
+                "end": fmt(OPENED + timedelta(hours=3)),
+            },
+        ],
+    )
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["reset_applied"] is True
+    assert data["exposure_origin_at_utc"] == fmt(OPENED + timedelta(hours=2))
+    assert data["total_seconds"] == 7200
+    assert data["dry_seconds"] == 1800
+    assert data["effective_seconds"] == 5400
+    assert data["effective_exposure_minutes"] == 90
+    assert data["verdict"] == "available"
+    assert data["remaining_minutes"] == 78
+
+
+def test_rebake_timestamp_accepted_in_non_utc_timezone(client):
+    # rebake 用 +08:00 表达：2026-09-01T10:00:00+08:00 = 02:00Z。
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=4)),
+        rebake_completed_at="2026-09-01T10:00:00+08:00",
+    )
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["reset_applied"] is True
+    assert data["exposure_origin_at_utc"] == "2026-09-01T02:00:00Z"
+    assert data["total_seconds"] == 7200
+    assert data["effective_exposure_minutes"] == 120
+
+
+def test_rebake_inside_dry_interval_rejected(client):
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=4)),
+        rebake_completed_at=fmt(OPENED + timedelta(minutes=45)),
+        dry_intervals=[
+            {
+                "start": fmt(OPENED + timedelta(minutes=30)),
+                "end": fmt(OPENED + timedelta(hours=1)),
+            }
+        ],
+    )
+    resp = judge(client, body)
+    assert_422_with_loc(resp, ("body", "rebake_completed_at"))
+    assert (
+        resp.json()["detail"][0]["type"]
+        == "value_error.rebake_dry_interval_conflict"
+    )
+
+
+def test_rebake_coinciding_with_dry_interval_endpoints_rejected(client):
+    # 与区间 start 重合。
+    body_start = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=4)),
+        rebake_completed_at=fmt(OPENED + timedelta(minutes=30)),
+        dry_intervals=[
+            {
+                "start": fmt(OPENED + timedelta(minutes=30)),
+                "end": fmt(OPENED + timedelta(hours=1)),
+            }
+        ],
+    )
+    resp_start = judge(client, body_start)
+    assert_422_with_loc(resp_start, ("body", "rebake_completed_at"))
+
+    # 与区间 end 重合。
+    body_end = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=4)),
+        rebake_completed_at=fmt(OPENED + timedelta(hours=1)),
+        dry_intervals=[
+            {
+                "start": fmt(OPENED + timedelta(minutes=30)),
+                "end": fmt(OPENED + timedelta(hours=1)),
+            }
+        ],
+    )
+    resp_end = judge(client, body_end)
+    assert_422_with_loc(resp_end, ("body", "rebake_completed_at"))
+
+
+def test_rebake_equal_to_opened_or_pickup_rejected(client):
+    # 必须严格位于 (opened_at, pickup_at)：与任一端点相等都拒绝。
+    resp_opened = judge(
+        client,
+        payload(
+            pickup_at=fmt(OPENED + timedelta(hours=2)),
+            rebake_completed_at=fmt(OPENED),
+        ),
+    )
+    assert_422_with_loc(resp_opened, ("body", "rebake_completed_at"))
+    assert resp_opened.json()["detail"][0]["type"] == "value_error.rebake_out_of_range"
+
+    resp_pickup = judge(
+        client,
+        payload(
+            pickup_at=fmt(OPENED + timedelta(hours=2)),
+            rebake_completed_at=fmt(OPENED + timedelta(hours=2)),
+        ),
+    )
+    assert_422_with_loc(resp_pickup, ("body", "rebake_completed_at"))
+    assert resp_pickup.json()["detail"][0]["type"] == "value_error.rebake_out_of_range"
+
+
+def test_rebake_outside_window_rejected(client):
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=2)),
+        rebake_completed_at=fmt(OPENED + timedelta(hours=3)),
+    )
+    resp = judge(client, body)
+    assert_422_with_loc(resp, ("body", "rebake_completed_at"))
+    assert resp.json()["detail"][0]["type"] == "value_error.rebake_out_of_range"
+
+
+def test_rebake_requires_rfc3339_seconds_with_timezone(client):
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=2)),
+        rebake_completed_at="2026-09-01T01:00:00",  # 裸时间
+    )
+    resp = judge(client, body)
+    assert_422_with_loc(resp, ("body", "rebake_completed_at"))
+
+
+def test_rebake_conflict_reports_field_alongside_other_violations(client):
+    # rebake 落在零长区间上，既要报区间零长，也要报 rebake 冲突，整单 422。
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=2)),
+        rebake_completed_at=fmt(OPENED + timedelta(hours=1)),
+        dry_intervals=[
+            {
+                "start": fmt(OPENED + timedelta(hours=1)),
+                "end": fmt(OPENED + timedelta(hours=1)),
+            }
+        ],
+    )
+    resp = judge(client, body)
+    assert resp.status_code == 422
+    locs = [tuple(item["loc"]) for item in resp.json()["detail"]]
+    assert ("body", "rebake_completed_at") in locs
+    assert ("body", "dry_intervals", 0, "end") in locs
+
+
+def test_omitting_rebake_keeps_legacy_calculation_and_response(client):
+    # 旧请求（不带 rebake_completed_at）计算结果不变，新增字段给出兼容值。
+    body = payload(
+        pickup_at=fmt(OPENED + timedelta(hours=2, minutes=30)),
+        dry_intervals=[
+            {
+                "start": "2026-09-01T08:30:00+08:00",  # = 00:30Z
+                "end": "2026-09-01T09:00:00+08:00",    # = 01:00Z
+            }
+        ],
+    )
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["reset_applied"] is False
+    assert data["exposure_origin_at_utc"] == data["opened_at_utc"]
+    assert data["total_seconds"] == 9000
+    assert data["dry_seconds"] == 1800
+    assert data["effective_seconds"] == 7200
+    assert data["effective_exposure_minutes"] == 120
+    assert data["verdict"] == "available"
+
+
+def test_explicit_null_rebake_matches_omitted(client):
+    body = payload(rebake_completed_at=None)
+    resp = judge(client, body)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["reset_applied"] is False
+    assert data["exposure_origin_at_utc"] == data["opened_at_utc"]
+
+
 def test_healthz(client):
     resp = client.get("/healthz")
     assert resp.status_code == 200

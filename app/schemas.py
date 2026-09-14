@@ -68,6 +68,15 @@ class JudgeRequest(BaseModel):
     level: MSLLevel
     opened_at: Rfc3339Seconds
     pickup_at: Rfc3339Seconds
+    rebake_completed_at: Rfc3339Seconds | None = Field(
+        default=None,
+        description=(
+            "可选：已开封料盘一次合格烘烤的完成时刻（带时区 RFC3339 秒精度）。"
+            "提供后有效暴露从该时刻重新累计，且只扣除该时刻之后的回干区间；"
+            "必须严格位于 opened_at 与 pickup_at 之间，且不得落入任何回干区间"
+            "或与其端点重合。省略时沿用从 opened_at 起算的旧计算。"
+        ),
+    )
     dry_intervals: list[DryInterval] = Field(default_factory=list)
 
 
@@ -79,10 +88,19 @@ class JudgeResponse(BaseModel):
     exceeded_minutes: int
     opened_at_utc: datetime
     pickup_at_utc: datetime
+    exposure_origin_at_utc: datetime = Field(
+        description=(
+            "有效暴露的起算时刻（UTC）：传入 rebake_completed_at 时为该时刻，"
+            "否则等于 opened_at_utc。"
+        )
+    )
+    reset_applied: bool = Field(
+        description="本次判定是否因 rebake_completed_at 而重新累计暴露。"
+    )
     total_seconds: int
     dry_seconds: int
     effective_seconds: int
 
-    @field_serializer("opened_at_utc", "pickup_at_utc")
+    @field_serializer("opened_at_utc", "pickup_at_utc", "exposure_origin_at_utc")
     def _serialize_utc(self, value: datetime) -> str:
         return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

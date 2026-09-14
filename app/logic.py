@@ -4,7 +4,12 @@
 - opened_at 不得晚于 pickup_at；
 - 每个回干区间必须 start < end，且完整落在 [opened_at, pickup_at] 内；
 - 回干区间两两不得相交，也不得端点相接（前一区间的 end 必须严格小于后一区间的 start）；
-- 有效暴露分钟 = floor((总秒数 - 回干秒数合计) / 60)；
+- 可选的 rebake_completed_at（合格烘烤完成时刻）必须严格位于
+  (opened_at, pickup_at) 内，且不得落入任何回干区间或与其端点重合；
+- 未提供 rebake_completed_at 时，有效暴露从 opened_at 起算；提供后从该时刻
+  重新累计，只扣除起算时刻之后的回干区间（起算时刻之前的区间不再影响结论）；
+- 有效暴露分钟 = floor((总秒数 - 回干秒数合计) / 60)，其中总秒数与回干秒数
+  均以实际起算时刻为基准；
 - 小于限额 → available，等于限额 → boundary_available，大于限额 → expired。
 
 任何违规都收集为带字段定位的错误列表，整单以 422 拒绝，不产出部分判定。
@@ -35,6 +40,7 @@ def enforce_business_rules(payload: JudgeRequest) -> None:
     errors: list[dict[str, Any]] = []
     opened = payload.opened_at
     pickup = payload.pickup_at
+    intervals = payload.dry_intervals
 
     if opened > pickup:
         errors.append(
@@ -45,7 +51,29 @@ def enforce_business_rules(payload: JudgeRequest) -> None:
             )
         )
 
-    intervals = payload.dry_intervals
+    rebake = payload.rebake_completed_at
+    if rebake is not None:
+        if not (opened < rebake < pickup):
+            errors.append(
+                _error(
+                    ("rebake_completed_at",),
+                    "rebake_completed_at must be strictly between opened_at and "
+                    "pickup_at",
+                    "value_error.rebake_out_of_range",
+                )
+            )
+        # 烘烤完成时刻不得落入任何回干区间，也不得与其端点重合。
+        for index, interval in enumerate(intervals):
+            if interval.start <= rebake <= interval.end:
+                errors.append(
+                    _error(
+                        ("rebake_completed_at",),
+                        f"rebake_completed_at must not fall inside dry interval "
+                        f"#{index} or coincide with either of its endpoints",
+                        "value_error.rebake_dry_interval_conflict",
+                    )
+                )
+
     for index, interval in enumerate(intervals):
         if interval.start >= interval.end:
             errors.append(
@@ -94,10 +122,15 @@ def enforce_business_rules(payload: JudgeRequest) -> None:
 
 def compute_judgement(payload: JudgeRequest) -> JudgeResponse:
     """在已通过全部校验的请求上计算唯一上线结论与可复核分钟数。"""
-    total_seconds = int((payload.pickup_at - payload.opened_at).total_seconds())
+    reset_applied = payload.rebake_completed_at is not None
+    # 提供合格烘烤完成时刻后从该时刻重新累计；否则沿用 opened_at 起算。
+    origin = payload.rebake_completed_at or payload.opened_at
+    total_seconds = int((payload.pickup_at - origin).total_seconds())
+    # 只扣除起算时刻之后的回干区间；校验已保证没有区间跨过或接触起算时刻。
     dry_seconds = sum(
         int((interval.end - interval.start).total_seconds())
         for interval in payload.dry_intervals
+        if interval.start >= origin
     )
     effective_seconds = total_seconds - dry_seconds
     effective_minutes = effective_seconds // 60
@@ -124,6 +157,8 @@ def compute_judgement(payload: JudgeRequest) -> JudgeResponse:
         exceeded_minutes=exceeded_minutes,
         opened_at_utc=payload.opened_at,
         pickup_at_utc=payload.pickup_at,
+        exposure_origin_at_utc=origin,
+        reset_applied=reset_applied,
         total_seconds=total_seconds,
         dry_seconds=dry_seconds,
         effective_seconds=effective_seconds,
