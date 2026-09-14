@@ -4,7 +4,9 @@
 - RFC3339 完整日期时间格式：YYYY-MM-DDTHH:MM:SS
 - 显式时区：结尾 Z/z 或 ±HH:MM 偏移；其中 -00:00 按 RFC3339 语义表示
   “本地偏移未知”，无法换算为确定的 UTC 时刻，必须拒绝（UTC 请用 Z/+00:00）
-- 秒精度：不允许小数秒；秒值 60 表示闰秒，按 RFC3339 接受并归一化到 UTC
+- 秒精度：不允许小数秒；秒值 60 仅在该时刻确为真实闰秒（IERS 公告，
+  均为 UTC 23:59:60，最后一次 2016-12-31）时接受，归一化到下一分钟 :00；
+  非闰秒时刻写 :60 一律拒绝
 - 解析后统一换算为 UTC 再参与比较与计算；字符串本身合法但换算后越过
   datetime 可表示边界的时间同样拒绝，错误定位到对应字段
 """
@@ -18,7 +20,40 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_serializer
 
 # 严格的 RFC3339 秒精度格式（含时区），拒绝小数秒与裸时间。
-# 秒字段额外允许 60：RFC3339 用 :60 表示闰秒。
+# 秒字段额外允许 60：RFC3339 用 :60 表示闰秒，但只有下列 IERS 公告中真实
+# 发生过闰秒的 UTC 日期（闰秒统一为该日 23:59:60Z）才合法；1972 年起共
+# 27 次，最近一次为 2016-12-31。RFC3339 §4.3 要求接收方据已知闰秒表判定。
+_LEAP_SECOND_UTC_DATES: frozenset[tuple[int, int, int]] = frozenset(
+    {
+        (1972, 6, 30), (1972, 12, 31),
+        (1973, 12, 31),
+        (1974, 12, 31),
+        (1975, 12, 31),
+        (1976, 12, 31),
+        (1977, 12, 31),
+        (1978, 12, 31),
+        (1979, 12, 31),
+        (1981, 6, 30),
+        (1982, 6, 30),
+        (1983, 6, 30),
+        (1985, 6, 30),
+        (1987, 12, 31),
+        (1989, 12, 31),
+        (1990, 12, 31),
+        (1992, 6, 30),
+        (1993, 6, 30),
+        (1994, 6, 30),
+        (1995, 12, 31),
+        (1997, 6, 30),
+        (1998, 12, 31),
+        (2005, 12, 31),
+        (2008, 12, 31),
+        (2012, 6, 30),
+        (2015, 6, 30),
+        (2016, 12, 31),
+    }
+)
+
 _RFC3339_SECONDS_RE = re.compile(
     r"^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])"
     r"[Tt](?:[01]\d|2[0-3]):[0-5]\d:(?:[0-5]\d|60)"
@@ -60,8 +95,8 @@ def _parse_rfc3339_seconds(value: object) -> datetime:
 
     is_leap_second = second == 60
     if is_leap_second:
-        # 闰秒无法用普通 datetime 表示：先以该分钟的第 59 秒构造，换算后
-        # 再顺延 1 秒（POSIX/Unix 时间戳对闰秒的标准归一化方式）。
+        # 闰秒无法用普通 datetime 表示：先以该分钟的第 59 秒构造，换算 UTC
+        # 后再判断它是否为真实闰秒并顺延 1 秒。
         second = 59
 
     try:
@@ -74,15 +109,33 @@ def _parse_rfc3339_seconds(value: object) -> datetime:
 
     try:
         result = parsed.astimezone(timezone.utc)
-        if is_leap_second:
-            result += timedelta(seconds=1)
     except (OverflowError, ValueError):
-        # 字符串格式合法，但换算到 UTC（含闰秒归一化）后越过了 datetime
-        # 可表示的日期边界。
+        # 字符串格式合法，但换算到 UTC 后越过了 datetime 可表示的日期边界。
         raise ValueError(
             "timestamp is out of range after conversion to UTC; conversion "
             "crosses the representable date boundary"
         ) from None
+
+    if is_leap_second:
+        # 闰秒只可能发生在 UTC 当日 23:59:60，且日期必须在 IERS 闰秒表内；
+        # 非闰秒时刻写 :60 属于无效时间，必须拒绝。
+        if (
+            result.hour != 23
+            or result.minute != 59
+            or (result.year, result.month, result.day) not in _LEAP_SECOND_UTC_DATES
+        ):
+            raise ValueError(
+                "second 60 is valid only for an actual UTC leap second "
+                "(23:59:60Z on an IERS-announced date; most recent "
+                "2016-12-31); this timestamp is not a real leap second"
+            )
+        try:
+            result += timedelta(seconds=1)  # POSIX/Unix 时间戳闰秒归一化
+        except (OverflowError, ValueError):
+            raise ValueError(
+                "timestamp is out of range after conversion to UTC; conversion "
+                "crosses the representable date boundary"
+            ) from None
     return result
 
 

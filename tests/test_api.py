@@ -728,3 +728,43 @@ def test_leap_second_accepted_and_normalized_to_utc(client):
     resp_offset = judge(client, body_offset)
     assert resp_offset.status_code == 200, resp_offset.text
     assert resp_offset.json()["opened_at_utc"] == "2017-01-01T00:00:00Z"
+
+
+def test_non_leap_second_60_rejected(client):
+    # 秒 60 只在真实闰秒（UTC 23:59:60 且日期在 IERS 闰秒表内）时合法；
+    # 备料员把普通时刻误写成 60 秒必须收到 422，而不是被当作合法时间判定。
+    fake_leap_inputs = [
+        ("ordinary minute", "2026-09-01T08:00:60+08:00"),
+        ("wrong second on leap date", "2016-12-31T23:58:60Z"),
+        ("noon on leap date", "2016-12-31T12:59:60Z"),
+        ("non-leap year-end", "2026-12-31T23:59:60Z"),
+        ("date never announced", "2016-06-30T23:59:60Z"),
+        ("midnight 60", "2026-09-01T00:00:60Z"),
+    ]
+    for label, opened in fake_leap_inputs:
+        resp = judge(
+            client,
+            payload(
+                opened_at=opened,
+                pickup_at="2026-09-02T00:00:00Z",
+            ),
+        )
+        assert_422_with_loc(resp, ("body", "opened_at")), label
+
+    # 真实闰秒用偏移表达仍合法；对照非闰秒日期上的同一墙钟写法必须拒绝。
+    ok_resp = judge(
+        client,
+        payload(
+            opened_at="2017-01-01T07:59:60+08:00",  # = 2016-12-31T23:59:60Z
+            pickup_at="2017-01-01T08:02:00+08:00",
+        ),
+    )
+    assert ok_resp.status_code == 200, ok_resp.text
+    bad_resp = judge(
+        client,
+        payload(
+            opened_at="2017-01-01T07:59:60+09:00",  # 对应 UTC 22:59:60，非闰秒
+            pickup_at="2017-01-01T08:02:00+09:00",
+        ),
+    )
+    assert_422_with_loc(bad_resp, ("body", "opened_at"))
